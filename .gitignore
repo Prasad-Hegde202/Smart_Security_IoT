@@ -1,0 +1,20 @@
+# Python
+env/
+__pycache__/
+*.pyc
+
+# Database
+*.db
+*.db-journal
+
+# Uploads
+uploads/
+
+# OS files
+.DS_Store
+
+# Node (future frontend)
+node_modules/
+
+# Wheels
+*.whl
