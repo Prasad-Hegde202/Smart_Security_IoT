@@ -4,7 +4,7 @@ import requests
 import sqlite3
 from datetime import datetime
 from flask_cors import CORS
-from deepface import DeepFace   # no dlib, no cmake, no compilation
+from deepface import DeepFace
 
 app = Flask(__name__)
 CORS(app)
@@ -21,9 +21,9 @@ else:
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 DB_PATH    = os.path.join(BASE_DIR, "alerts.db")
 
-# Known faces: just drop photos here — no encoding or training needed
-# e.g.  known_faces/john.jpg   known_faces/jane.jpg
-# Name shown in results = filename without extension
+# known_faces/ is always relative to app.py so it works locally AND
+# on Render as long as you commit the photos to your git repo
+# OR upload them via POST /known-faces/add after deploy
 KNOWN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_faces")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -38,7 +38,7 @@ print(f"[sentinel] Known faces: {KNOWN_DIR}")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID   = os.environ.get("CHAT_ID",   "")
 
-def send_telegram_alert(image_path):
+def send_telegram_alert(image_path, unknown_count):
     if not BOT_TOKEN or not CHAT_ID:
         print("[sentinel] Telegram not configured — skipping")
         return
@@ -47,7 +47,10 @@ def send_telegram_alert(image_path):
         with open(image_path, "rb") as img:
             resp = requests.post(
                 url,
-                data={"chat_id": CHAT_ID, "caption": "🚨 Unknown person detected!"},
+                data={
+                    "chat_id": CHAT_ID,
+                    "caption": f"🚨 {unknown_count} unknown person(s) detected!"
+                },
                 files={"photo": img},
                 timeout=10
             )
@@ -76,45 +79,86 @@ def init_db():
 
 init_db()
 
-# ── Face check via DeepFace ────────────────────────────────────────────────
-def is_known_face(image_path):
+# ── Face recognition ───────────────────────────────────────────────────────
+def recognize_faces(image_path):
     """
-    Returns (True, name)  — face matches someone in known_faces/
-    Returns (False, "Unknown") — no match or no known faces registered
-
-    DeepFace.find() compares the uploaded photo against every image
-    in known_faces/ automatically. Zero training required.
+    Returns a list of names for every face detected in the image.
+    Matches the old face_recognition behavior:
+      ["prasad", "Unknown", "Unknown"]
+    
+    Strategy:
+      1. Use DeepFace.extract_faces() to find HOW MANY faces are in the image
+      2. For each face, crop it and run DeepFace.find() against known_faces/
+      3. Return a name per face
     """
     known_photos = [
         f for f in os.listdir(KNOWN_DIR)
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
     ]
 
-    if not known_photos:
-        print("[sentinel] known_faces/ is empty — all faces marked Unknown")
-        return False, "Unknown"
+    results = []
 
     try:
-        results = DeepFace.find(
+        # Step 1: detect all faces in the image
+        faces = DeepFace.extract_faces(
             img_path          = image_path,
-            db_path           = KNOWN_DIR,
-            model_name        = "Facenet",   # lightweight & accurate
-            detector_backend  = "opencv",    # fastest, no extra deps
-            enforce_detection = False,       # don't crash on unclear faces
-            silent            = True
+            detector_backend  = "opencv",
+            enforce_detection = False
         )
 
-        # results = list of DataFrames, one per detected face
-        if results and not results[0].empty:
-            matched_path = results[0].iloc[0]["identity"]
-            name = os.path.splitext(os.path.basename(matched_path))[0]
-            print(f"[sentinel] Matched known face: {name}")
-            return True, name
+        if not faces:
+            print("[sentinel] No faces detected in image")
+            return []
+
+        print(f"[sentinel] Detected {len(faces)} face(s)")
+
+        # Step 2: identify each face
+        for i, face_obj in enumerate(faces):
+            name = "Unknown"
+
+            # Only try to match if we have known faces registered
+            if known_photos:
+                try:
+                    # Save the cropped face temporarily for matching
+                    import cv2
+                    import numpy as np
+
+                    face_pixels = (face_obj["face"] * 255).astype(np.uint8)
+                    temp_path   = os.path.join(UPLOAD_DIR, f"_temp_face_{i}.jpg")
+                    cv2.imwrite(temp_path, cv2.cvtColor(face_pixels, cv2.COLOR_RGB2BGR))
+
+                    match_results = DeepFace.find(
+                        img_path          = temp_path,
+                        db_path           = KNOWN_DIR,
+                        model_name        = "Facenet",
+                        detector_backend  = "opencv",
+                        enforce_detection = False,
+                        silent            = True
+                    )
+
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+                    if match_results and not match_results[0].empty:
+                        matched_path = match_results[0].iloc[0]["identity"]
+                        name = os.path.splitext(os.path.basename(matched_path))[0]
+                        print(f"[sentinel] Face {i+1}: matched → {name}")
+                    else:
+                        print(f"[sentinel] Face {i+1}: Unknown")
+
+                except Exception as e:
+                    print(f"[sentinel] Face {i+1} match error: {e}")
+                    name = "Unknown"
+            else:
+                print(f"[sentinel] Face {i+1}: Unknown (no known faces registered)")
+
+            results.append(name)
 
     except Exception as e:
-        print(f"[sentinel] DeepFace error: {e}")
+        print(f"[sentinel] DeepFace extract error: {e}")
 
-    return False, "Unknown"
+    return results
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -148,10 +192,15 @@ def upload_image():
     filepath = os.path.join(UPLOAD_DIR, filename)
     file.save(filepath)
 
-    known, name = is_known_face(filepath)
+    # Get name for every face in the image — same as old behavior
+    results       = recognize_faces(filepath)
+    unknown_count = results.count("Unknown")
+    has_unknown   = unknown_count > 0
 
-    if not known:
-        send_telegram_alert(filepath)
+    if has_unknown:
+        # Send one Telegram alert per upload (not per face)
+        send_telegram_alert(filepath, unknown_count)
+
         conn = get_db()
         conn.execute(
             "INSERT INTO alerts (timestamp, status, image_path) VALUES (?, ?, ?)",
@@ -159,14 +208,14 @@ def upload_image():
         )
         conn.commit()
         conn.close()
-        print("[sentinel] Unknown face — alert saved + Telegram sent")
+        print(f"[sentinel] {unknown_count} unknown face(s) — alert saved")
     else:
-        print(f"[sentinel] Known face ({name}) — no alert")
+        print(f"[sentinel] All faces known: {results}")
 
+    # ── Response matches old face_recognition format exactly ──────────────
     return jsonify({
-        "face_detected": True,
-        "name":          name,
-        "alert_sent":    not known
+        "faces_detected": len(results),
+        "results":        results           # e.g. ["prasad", "Unknown"]
     })
 
 @app.route("/alerts")
@@ -180,26 +229,33 @@ def get_alerts():
 def serve_image(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-# ── Register a known face via API ──────────────────────────────────────────
-# Useful when running on cloud where you can't drop files manually
+# ── Known face management ──────────────────────────────────────────────────
 @app.route("/known-faces/add", methods=["POST"])
 def add_known_face():
     """
-    POST form-data with:
-      image = <photo file>
-      name  = "john_doe"
-    Saves to known_faces/john_doe.jpg
+    Register a known face.
+    POST form-data:
+      name  = "prasad"         (text field)
+      image = <photo file>     (file field)
+
+    On cloud: use this endpoint after every redeploy since /tmp is wiped.
+    Locally:  you can also just drop photos into known_faces/ folder directly.
     """
     if "image" not in request.files or "name" not in request.form:
         return jsonify({"error": "Provide 'image' file and 'name' text field"}), 400
 
-    name     = request.form["name"].strip().replace(" ", "_")
+    name     = request.form["name"].strip().replace(" ", "_").lower()
     file     = request.files["image"]
     savepath = os.path.join(KNOWN_DIR, f"{name}.jpg")
     file.save(savepath)
-    return jsonify({"message": f"Added known face: {name}", "path": savepath})
 
-@app.route("/known-faces")
+    print(f"[sentinel] Registered known face: {name} → {savepath}")
+    return jsonify({
+        "message": f"Known face '{name}' registered successfully",
+        "path":    savepath
+    })
+
+@app.route("/known-faces", methods=["GET"])
 def list_known_faces():
     names = [
         os.path.splitext(f)[0]
@@ -207,6 +263,14 @@ def list_known_faces():
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
     ]
     return jsonify({"known_faces": names, "count": len(names)})
+
+@app.route("/known-faces/<name>", methods=["DELETE"])
+def delete_known_face(name):
+    path = os.path.join(KNOWN_DIR, f"{name}.jpg")
+    if os.path.exists(path):
+        os.remove(path)
+        return jsonify({"message": f"Deleted known face: {name}"})
+    return jsonify({"error": "Not found"}), 404
 
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
