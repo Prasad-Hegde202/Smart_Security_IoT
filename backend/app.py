@@ -2,8 +2,12 @@ from flask import Flask, request, jsonify, send_from_directory
 import os
 import requests
 import sqlite3
+import numpy as np
+import cv2
+import pickle
 from datetime import datetime
 from flask_cors import CORS
+from sklearn.metrics.pairwise import cosine_similarity
 
 app = Flask(__name__)
 CORS(app)
@@ -16,17 +20,17 @@ if IS_CLOUD:
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH    = os.path.join(BASE_DIR, "alerts.db")
-KNOWN_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_faces")
+UPLOAD_DIR   = os.path.join(BASE_DIR, "uploads")
+DB_PATH      = os.path.join(BASE_DIR, "alerts.db")
+KNOWN_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "known_faces")
+ENCODINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "encodings.pkl")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(KNOWN_DIR,  exist_ok=True)
 
-print(f"[sentinel] Mode       : {'CLOUD' if IS_CLOUD else 'LOCAL'}")
-print(f"[sentinel] Uploads    : {UPLOAD_DIR}")
-print(f"[sentinel] Database   : {DB_PATH}")
-print(f"[sentinel] Known faces: {KNOWN_DIR}")
+print(f"[sentinel] Mode    : {'CLOUD' if IS_CLOUD else 'LOCAL'}")
+print(f"[sentinel] Uploads : {UPLOAD_DIR}")
+print(f"[sentinel] Database: {DB_PATH}")
 
 # ── Telegram ───────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -70,135 +74,166 @@ def init_db():
 
 init_db()
 
-# ── DeepFace — lazy import + model pre-warm ────────────────────────────────
-# Import is deferred so the app starts fast.
-# We then pre-download/cache the model ONCE at startup
-# so the first real request doesn't time out.
-print("[sentinel] Pre-loading DeepFace model...")
+# ── Load InsightFace ───────────────────────────────────────────────────────
+# InsightFace uses ONNX runtime — no TensorFlow, no PyTorch
+# RAM usage: ~150MB vs TensorFlow's 500MB+
+print("[sentinel] Loading InsightFace model...")
 try:
-    # Use the lightest model: VGG-Face (~500MB less than Facenet on RAM)
-    # opencv detector — no extra deps, fastest
-    from deepface import DeepFace
-    import numpy as np
-    import cv2
+    import insightface
+    from insightface.app import FaceAnalysis
 
-    # Warm up: build a tiny blank image and run a dummy verify
-    # This forces model weights to download & cache now, not on first request
-    dummy = np.zeros((100, 100, 3), dtype=np.uint8)
-    dummy_path = "/tmp/_sentinel_warmup.jpg"
-    cv2.imwrite(dummy_path, dummy)
-
-    try:
-        DeepFace.represent(
-            img_path          = dummy_path,
-            model_name        = "VGG-Face",
-            detector_backend  = "opencv",
-            enforce_detection = False
-        )
-    except Exception:
-        pass  # expected to fail on blank image, but model is now cached
-
-    os.remove(dummy_path)
-    print("[sentinel] DeepFace model ready ✓")
-    DEEPFACE_READY = True
+    face_app = FaceAnalysis(
+        name       = "buffalo_sc",   # smallest model: detection + recognition
+        providers  = ["CPUExecutionProvider"]  # CPU only (no GPU on Render)
+    )
+    face_app.prepare(ctx_id=0, det_size=(320, 320))  # 320 instead of 640 = less RAM
+    print("[sentinel] InsightFace ready ✓")
+    FACE_APP_READY = True
 
 except Exception as e:
-    print(f"[sentinel] DeepFace failed to load: {e}")
-    DEEPFACE_READY = False
+    print(f"[sentinel] InsightFace failed to load: {e}")
+    face_app = None
+    FACE_APP_READY = False
+
+# ── Known face encodings ───────────────────────────────────────────────────
+# Stored as { name: embedding_vector }
+# Built from photos in known_faces/ folder
+# Saved to encodings.pkl so it persists across requests
+
+def load_encodings():
+    """Load saved encodings from disk."""
+    if os.path.exists(ENCODINGS_FILE):
+        with open(ENCODINGS_FILE, "rb") as f:
+            return pickle.load(f)
+    return {}   # { "prasad": np.array([...]) }
+
+def save_encodings(encodings):
+    """Save encodings to disk."""
+    with open(ENCODINGS_FILE, "wb") as f:
+        pickle.dump(encodings, f)
+
+def get_face_embedding(image_path):
+    """Get face embedding vector from an image. Returns None if no face found."""
+    if not FACE_APP_READY:
+        return None
+    try:
+        img   = cv2.imread(image_path)
+        faces = face_app.get(img)
+        if not faces:
+            return None
+        # Return embedding of the largest (most prominent) face
+        largest = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+        return largest.embedding
+    except Exception as e:
+        print(f"[sentinel] Embedding error: {e}")
+        return None
+
+def rebuild_encodings_from_folder():
+    """
+    Scan known_faces/ folder and build embeddings for all photos.
+    Call this after adding new known faces.
+    """
+    if not FACE_APP_READY:
+        return {}
+
+    encodings = {}
+    photos = [f for f in os.listdir(KNOWN_DIR) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+
+    for photo in photos:
+        name  = os.path.splitext(photo)[0]
+        path  = os.path.join(KNOWN_DIR, photo)
+        emb   = get_face_embedding(path)
+        if emb is not None:
+            encodings[name] = emb
+            print(f"[sentinel] Encoded known face: {name}")
+        else:
+            print(f"[sentinel] No face found in {photo} — skipping")
+
+    save_encodings(encodings)
+    return encodings
+
+# Load existing encodings on startup
+known_encodings = load_encodings()
+print(f"[sentinel] Loaded {len(known_encodings)} known face encoding(s)")
+
+# If encodings.pkl is empty but known_faces/ has photos, rebuild
+if not known_encodings:
+    known_photos = [f for f in os.listdir(KNOWN_DIR) if f.lower().endswith((".jpg",".jpeg",".png"))]
+    if known_photos:
+        print("[sentinel] Rebuilding encodings from known_faces/ folder...")
+        known_encodings = rebuild_encodings_from_folder()
 
 # ── Face recognition ───────────────────────────────────────────────────────
+SIMILARITY_THRESHOLD = 0.4   # tune: higher = stricter matching
+
 def recognize_faces(image_path):
     """
     Returns list of names for every face in the image.
     e.g. ["prasad", "Unknown"]
+    Matches old face_recognition response format exactly.
     """
-    if not DEEPFACE_READY:
-        print("[sentinel] DeepFace not ready — returning Unknown")
+    if not FACE_APP_READY:
         return ["Unknown"]
 
-    known_photos = [
-        f for f in os.listdir(KNOWN_DIR)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    ]
-
-    results = []
-
     try:
-        # Step 1: detect all faces
-        faces = DeepFace.extract_faces(
-            img_path          = image_path,
-            detector_backend  = "opencv",
-            enforce_detection = False
-        )
+        img   = cv2.imread(image_path)
+        faces = face_app.get(img)
 
         if not faces:
             print("[sentinel] No faces detected")
             return []
 
         print(f"[sentinel] {len(faces)} face(s) detected")
+        results = []
 
-        # Step 2: identify each face
-        for i, face_obj in enumerate(faces):
+        for i, face in enumerate(faces):
             name = "Unknown"
 
-            if known_photos:
-                try:
-                    # Save cropped face to temp file for matching
-                    face_pixels = (face_obj["face"] * 255).astype(np.uint8)
-                    temp_path   = os.path.join(UPLOAD_DIR, f"_tmp_face_{i}.jpg")
-                    cv2.imwrite(temp_path, cv2.cvtColor(face_pixels, cv2.COLOR_RGB2BGR))
+            if known_encodings:
+                query_emb = face.embedding.reshape(1, -1)
 
-                    match_results = DeepFace.find(
-                        img_path          = temp_path,
-                        db_path           = KNOWN_DIR,
-                        model_name        = "VGG-Face",   # lighter than Facenet
-                        detector_backend  = "opencv",
-                        enforce_detection = False,
-                        silent            = True
-                    )
+                # Compare against all known faces
+                best_name  = None
+                best_score = -1
 
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
+                for known_name, known_emb in known_encodings.items():
+                    score = cosine_similarity(query_emb, known_emb.reshape(1, -1))[0][0]
+                    if score > best_score:
+                        best_score = score
+                        best_name  = known_name
 
-                    if match_results and not match_results[0].empty:
-                        matched_path = match_results[0].iloc[0]["identity"]
-                        name = os.path.splitext(os.path.basename(matched_path))[0]
-                        print(f"[sentinel] Face {i+1} → {name}")
-                    else:
-                        print(f"[sentinel] Face {i+1} → Unknown")
-
-                except Exception as e:
-                    print(f"[sentinel] Face {i+1} match error: {e}")
+                if best_score >= SIMILARITY_THRESHOLD:
+                    name = best_name
+                    print(f"[sentinel] Face {i+1} → {name} (score: {best_score:.2f})")
+                else:
+                    print(f"[sentinel] Face {i+1} → Unknown (best score: {best_score:.2f})")
             else:
-                print(f"[sentinel] Face {i+1} → Unknown (no known faces)")
+                print(f"[sentinel] Face {i+1} → Unknown (no known faces registered)")
 
             results.append(name)
 
-    except Exception as e:
-        print(f"[sentinel] extract_faces error: {e}")
+        return results
 
-    return results
+    except Exception as e:
+        print(f"[sentinel] recognize_faces error: {e}")
+        return ["Unknown"]
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.route("/")
 def home():
     return jsonify({
-        "status":        "running",
-        "environment":   "cloud" if IS_CLOUD else "local",
-        "deepface_ready": DEEPFACE_READY
+        "status":      "running",
+        "environment": "cloud" if IS_CLOUD else "local",
+        "model_ready": FACE_APP_READY
     })
 
 @app.route("/health")
 def health():
-    known_count = len([
-        f for f in os.listdir(KNOWN_DIR)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    ])
     return jsonify({
         "status":        "ok",
         "environment":   "cloud" if IS_CLOUD else "local",
-        "deepface_ready": DEEPFACE_READY,
-        "known_faces":   known_count,
+        "model_ready":   FACE_APP_READY,
+        "known_faces":   len(known_encodings),
     })
 
 @app.route("/upload", methods=["POST"])
@@ -206,8 +241,8 @@ def upload_image():
     if "image" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
-    if not DEEPFACE_READY:
-        return jsonify({"error": "Face recognition model not loaded yet, try again in 30 seconds"}), 503
+    if not FACE_APP_READY:
+        return jsonify({"error": "Face model not ready, try again shortly"}), 503
 
     file     = request.files["image"]
     filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
@@ -216,9 +251,8 @@ def upload_image():
 
     results       = recognize_faces(filepath)
     unknown_count = results.count("Unknown")
-    has_unknown   = unknown_count > 0
 
-    if has_unknown:
+    if unknown_count > 0:
         send_telegram_alert(filepath, unknown_count)
         conn = get_db()
         conn.execute(
@@ -227,13 +261,13 @@ def upload_image():
         )
         conn.commit()
         conn.close()
-        print(f"[sentinel] Alert saved — {unknown_count} unknown face(s)")
+        print(f"[sentinel] {unknown_count} unknown — alert saved")
     else:
         print(f"[sentinel] All known: {results}")
 
     return jsonify({
         "faces_detected": len(results),
-        "results":        results
+        "results":        results        # ["prasad", "Unknown"] — same as before
     })
 
 @app.route("/alerts")
@@ -247,31 +281,59 @@ def get_alerts():
 def serve_image(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
+# ── Known face management ──────────────────────────────────────────────────
 @app.route("/known-faces/add", methods=["POST"])
 def add_known_face():
+    """
+    Register a new known face.
+    POST form-data:
+      name  = "prasad"
+      image = <photo file>
+    """
+    global known_encodings
+
     if "image" not in request.files or "name" not in request.form:
         return jsonify({"error": "Provide 'image' file and 'name' text field"}), 400
+
+    if not FACE_APP_READY:
+        return jsonify({"error": "Face model not ready"}), 503
+
     name     = request.form["name"].strip().replace(" ", "_").lower()
     file     = request.files["image"]
     savepath = os.path.join(KNOWN_DIR, f"{name}.jpg")
     file.save(savepath)
+
+    # Generate and save embedding immediately
+    emb = get_face_embedding(savepath)
+    if emb is None:
+        os.remove(savepath)
+        return jsonify({"error": f"No face detected in the uploaded photo for '{name}'"}), 400
+
+    known_encodings[name] = emb
+    save_encodings(known_encodings)
+
     print(f"[sentinel] Registered: {name}")
-    return jsonify({"message": f"Known face '{name}' registered", "path": savepath})
+    return jsonify({
+        "message": f"Known face '{name}' registered successfully",
+        "total_known": len(known_encodings)
+    })
 
 @app.route("/known-faces")
 def list_known_faces():
-    names = [
-        os.path.splitext(f)[0]
-        for f in os.listdir(KNOWN_DIR)
-        if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    ]
-    return jsonify({"known_faces": names, "count": len(names)})
+    return jsonify({
+        "known_faces": list(known_encodings.keys()),
+        "count":       len(known_encodings)
+    })
 
 @app.route("/known-faces/<name>", methods=["DELETE"])
 def delete_known_face(name):
-    path = os.path.join(KNOWN_DIR, f"{name}.jpg")
-    if os.path.exists(path):
-        os.remove(path)
+    global known_encodings
+    if name in known_encodings:
+        del known_encodings[name]
+        save_encodings(known_encodings)
+        photo = os.path.join(KNOWN_DIR, f"{name}.jpg")
+        if os.path.exists(photo):
+            os.remove(photo)
         return jsonify({"message": f"Deleted: {name}"})
     return jsonify({"error": "Not found"}), 404
 
