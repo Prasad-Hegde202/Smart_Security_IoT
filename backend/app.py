@@ -342,6 +342,24 @@ def delete_known_face(n):
         return jsonify({"message": f"Deleted: {n}"})
     return jsonify({"error": "Not found"}), 404
 
+@app.route("/alerts/clear", methods=["DELETE"])
+def clear_alerts():
+    conn = get_db()
+    conn.execute("DELETE FROM alerts")
+    conn.commit()
+    conn.close()
+    return jsonify({"message": "All alerts cleared"})
+```
+
+After clearing, all **new** uploads will have the correct Render URL and images will load in dashboard and Telegram.
+
+---
+
+### Quick checklist to verify it's working
+
+**Step 1** — Check env var is set:
+```
+GET https://smart-security-backend-tvks.onrender.com/health
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", 5000))
