@@ -36,8 +36,8 @@ print(f"[sentinel] Backend URL: {BACKEND_URL}")
 print(f"[sentinel] Database   : {DB_PATH}")
 
 # ── Telegram ───────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("CHAT_ID",   "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8693553244:AAE4VtpVd2S7HOtk-wdWnbqcBW1no12S50g")
+CHAT_ID   = os.environ.get("CHAT_ID",   "6580212381")
 
 def send_telegram_alert(image_path, unknown_count):
     if not BOT_TOKEN or not CHAT_ID:
